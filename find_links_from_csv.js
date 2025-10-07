@@ -1,11 +1,11 @@
 /**
- * find_links_from_csv.js - Comic Link Finder (Single Site)
+ * find_links_resume.js - Resume Comic Link Finder
  *
- * Constructs comic URLs and verifies they exist
- * Optimized for speed with pattern caching
+ * Resumes from an existing output CSV
+ * Skips rows that already have links
  *
  * Usage:
- *   node find_links_from_csv.js input.csv output.csv
+ *   node find_links_resume.js input.csv output.csv
  */
 
 const fs = require('fs');
@@ -21,6 +21,9 @@ const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // Caches
 let urlCache = {};
 let seriesPatternCache = {};
+
+// Cache file paths
+const CACHE_FILE = 'scraper_cache.json';
 
 // ----- CONFIG -----
 const SITE = {
@@ -69,9 +72,32 @@ function getSeriesCacheKey(series, year) {
   return `${series.toLowerCase()}:${year}`;
 }
 
+/** Load cache from file */
+function loadCache() {
+  if (fs.existsSync(CACHE_FILE)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+      urlCache = data.urlCache || {};
+      seriesPatternCache = data.seriesPatternCache || {};
+      console.log(`Loaded cache: ${Object.keys(urlCache).length} URLs, ${Object.keys(seriesPatternCache).length} patterns`);
+    } catch (err) {
+      console.log('Could not load cache, starting fresh');
+    }
+  }
+}
+
+/** Save cache to file */
+function saveCache() {
+  try {
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({ urlCache, seriesPatternCache }, null, 2));
+  } catch (err) {
+    console.error('Error saving cache:', err.message);
+  }
+}
+
 // ----- Read CSV -----
 if (process.argv.length < 4) {
-  console.error('Usage: node find_links_from_csv.js input.csv output.csv');
+  console.error('Usage: node find_links_resume.js input.csv output.csv');
   process.exit(1);
 }
 
@@ -94,6 +120,22 @@ async function readCsv(file) {
   });
 }
 
+/** Read existing output to find where we stopped */
+async function readExistingOutput() {
+  if (!fs.existsSync(OUTPUT_CSV)) {
+    return [];
+  }
+  
+  return new Promise((res, rej) => {
+    const rows = [];
+    fs.createReadStream(OUTPUT_CSV)
+      .pipe(csv())
+      .on('data', data => rows.push(data))
+      .on('end', () => res(rows))
+      .on('error', err => rej(err));
+  });
+}
+
 /** Quick URL verification */
 async function verifyUrl(page, url) {
   try {
@@ -108,12 +150,10 @@ async function verifyUrl(page, url) {
     
     const finalUrl = page.url();
     
-    // Check for error redirects
     if (finalUrl.includes('/Error') || finalUrl.includes('/error') || finalUrl.includes('/404')) {
       return false;
     }
     
-    // Check if redirected away
     const urlBase = url.split('?')[0].split('#')[0];
     const finalBase = finalUrl.split('?')[0].split('#')[0];
     if (!finalBase.startsWith(urlBase.substring(0, urlBase.lastIndexOf('/')))) {
@@ -122,7 +162,6 @@ async function verifyUrl(page, url) {
     
     await wait(500);
     
-    // Quick content check
     const isValid = await page.evaluate(() => {
       const title = (document.title || '').toLowerCase();
       const body = (document.body.innerText || '').toLowerCase();
@@ -145,17 +184,14 @@ async function verifyUrl(page, url) {
 async function findWorkingUrl(page, series, year, issue) {
   const cacheKey = `${series}:${year}:${issue}`;
   
-  // Check URL cache
   if (urlCache[cacheKey] !== undefined) {
     return urlCache[cacheKey];
   }
   
-  // Check for cached pattern
   let cachedPattern = null;
   const seriesCacheKey = getSeriesCacheKey(series, year);
   cachedPattern = seriesPatternCache[seriesCacheKey];
   
-  // Also check if we have this series with any year
   if (!cachedPattern) {
     const seriesLower = series.toLowerCase();
     for (const key in seriesPatternCache) {
@@ -166,7 +202,6 @@ async function findWorkingUrl(page, series, year, issue) {
     }
   }
   
-  // Try cached pattern first
   if (cachedPattern) {
     const url = SITE.buildUrl(cachedPattern.variation, cachedPattern.year, issue);
     const isValid = await verifyUrl(page, url);
@@ -177,7 +212,6 @@ async function findWorkingUrl(page, series, year, issue) {
     }
   }
   
-  // Try variations with original year
   const variations = getSeriesVariations(series);
   
   for (const variation of variations) {
@@ -193,7 +227,6 @@ async function findWorkingUrl(page, series, year, issue) {
     await wait(200);
   }
   
-  // Try adjacent years
   const adjacentYears = [parseInt(year) - 1, parseInt(year) + 1];
   
   for (const adjYear of adjacentYears) {
@@ -211,7 +244,6 @@ async function findWorkingUrl(page, series, year, issue) {
     }
   }
   
-  // Try without year
   for (const variation of variations) {
     const url = SITE.buildUrl(variation, null, issue);
     const isValid = await verifyUrl(page, url);
@@ -284,10 +316,10 @@ async function processBatch(browser, rows, startIdx, batchSize, csvWriter) {
       console.log(`  ✗ Not found`);
     }
     
-    // Save every 20 rows
     if (batchResults.length >= 20) {
       await csvWriter.writeRecords(batchResults);
-      console.log(`  💾 Saved ${batchResults.length} rows`);
+      saveCache(); // Save cache every 20 rows
+      console.log(`  💾 Saved ${batchResults.length} rows + cache`);
       batchResults.length = 0;
     }
     
@@ -296,7 +328,8 @@ async function processBatch(browser, rows, startIdx, batchSize, csvWriter) {
   
   if (batchResults.length > 0) {
     await csvWriter.writeRecords(batchResults);
-    console.log(`  💾 Saved ${batchResults.length} rows`);
+    saveCache();
+    console.log(`  💾 Saved ${batchResults.length} rows + cache`);
   }
   
   await page.close();
@@ -304,22 +337,46 @@ async function processBatch(browser, rows, startIdx, batchSize, csvWriter) {
 
 // ----- Main -----
 (async () => {
-  console.log('Comic Link Finder - ReadComicOnline\n');
+  console.log('Comic Link Finder - RESUME MODE\n');
   
-  const rows = await readCsv(INPUT_CSV);
-  console.log(`Read ${rows.length} rows\n`);
-
-  if (rows.length === 0) {
-    console.error('No rows in CSV');
-    process.exit(1);
+  // Load cache
+  loadCache();
+  
+  // Read input CSV
+  const allRows = await readCsv(INPUT_CSV);
+  console.log(`Read ${allRows.length} rows from input\n`);
+  
+  // Read existing output
+  const existingRows = await readExistingOutput();
+  console.log(`Found ${existingRows.length} existing rows in output\n`);
+  
+  // Determine which rows need processing
+  let rowsToProcess = [];
+  let startIndex = 0;
+  
+  if (existingRows.length === 0) {
+    // No existing output, process all
+    rowsToProcess = allRows;
+    startIndex = 0;
+  } else {
+    // Skip rows that already have links
+    startIndex = existingRows.length;
+    rowsToProcess = allRows.slice(startIndex);
+    console.log(`Resuming from row ${startIndex + 1}\n`);
+  }
+  
+  if (rowsToProcess.length === 0) {
+    console.log('All rows already processed!');
+    process.exit(0);
   }
 
-  const originalHeaders = Object.keys(rows[0]).map(h => ({ id: h, title: h }));
+  const originalHeaders = Object.keys(allRows[0]).map(h => ({ id: h, title: h }));
   const headers = [...originalHeaders, { id: 'link', title: 'Link' }];
 
   const csvWriter = createCsvWriter({
     path: OUTPUT_CSV,
-    header: headers
+    header: headers,
+    append: existingRows.length > 0 // Append if file exists
   });
 
   const browser = await puppeteer.launch({
@@ -340,22 +397,24 @@ async function processBatch(browser, rows, startIdx, batchSize, csvWriter) {
   try {
     const startTime = Date.now();
     
-    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    for (let i = 0; i < rowsToProcess.length; i += BATCH_SIZE) {
       const batchNum = Math.floor(i / BATCH_SIZE) + 1;
-      const totalBatches = Math.ceil(rows.length / BATCH_SIZE);
+      const totalBatches = Math.ceil(rowsToProcess.length / BATCH_SIZE);
+      const actualRowNum = startIndex + i;
       
-      console.log(`\nBATCH ${batchNum}/${totalBatches} (rows ${i + 1}-${Math.min(i + BATCH_SIZE, rows.length)})`);
+      console.log(`\nBATCH ${batchNum}/${totalBatches} (rows ${actualRowNum + 1}-${Math.min(actualRowNum + BATCH_SIZE, allRows.length)})`);
       console.log('='.repeat(70));
       
-      await processBatch(browser, rows, i, BATCH_SIZE, csvWriter);
+      await processBatch(browser, rowsToProcess, i, BATCH_SIZE, csvWriter);
       
       const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
-      const rowsProcessed = Math.min(i + BATCH_SIZE, rows.length);
+      const rowsProcessed = Math.min(i + BATCH_SIZE, rowsToProcess.length);
       const avgPerRow = ((Date.now() - startTime) / rowsProcessed / 1000).toFixed(1);
-      const remaining = (avgPerRow * (rows.length - rowsProcessed) / 60).toFixed(1);
+      const remaining = (avgPerRow * (rowsToProcess.length - rowsProcessed) / 60).toFixed(1);
       
       console.log(`\nElapsed: ${elapsed}m | Avg: ${avgPerRow}s/row | Remaining: ${remaining}m`);
       console.log(`Cache: ${Object.keys(seriesPatternCache).length} patterns | ${Object.keys(urlCache).length} URLs`);
+      console.log(`Progress: ${startIndex + rowsProcessed}/${allRows.length} total rows`);
       
       await wait(1000);
     }
@@ -366,11 +425,20 @@ async function processBatch(browser, rows, startIdx, batchSize, csvWriter) {
     console.log(`\n${'='.repeat(70)}`);
     console.log(`COMPLETED in ${totalTime} minutes`);
     console.log(`Output: ${OUTPUT_CSV}`);
-    console.log(`Found: ${successCount}/${rows.length} links`);
+    console.log(`Processed: ${rowsToProcess.length} rows (total: ${allRows.length})`);
+    console.log(`Found: ${successCount} links`);
     console.log('='.repeat(70));
+    
+    // Clean up cache file
+    if (fs.existsSync(CACHE_FILE)) {
+      fs.unlinkSync(CACHE_FILE);
+      console.log('Cache file cleaned up');
+    }
     
   } catch (err) {
     console.error('Error:', err);
+    saveCache();
+    console.log('Cache saved for resume');
   } finally {
     await browser.close();
   }
